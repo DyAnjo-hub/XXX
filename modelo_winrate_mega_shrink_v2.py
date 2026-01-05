@@ -39,6 +39,84 @@ WEIGHT_CAP = 50.0  # teto do peso (evita dominância absoluta)
 DEFAULT_XLSX = "dados_mega_merged.xlsx"
 
 
+
+# ================================
+# Normalização de colunas (robusto)
+# ================================
+
+def _norm_colname(c: str) -> str:
+    c = str(c).strip().lower()
+    c = c.replace(" ", "_")
+    c = c.replace("-", "_")
+    return c
+
+def _rename_columns_vs(df: pd.DataFrame) -> pd.DataFrame:
+    """Garante colunas: champion, vs, winrate, games"""
+    df = df.copy()
+    df.columns = [_norm_colname(c) for c in df.columns]
+
+    def pick(candidates):
+        for cand in candidates:
+            if cand in df.columns:
+                return cand
+        return None
+
+    col_champion = pick(["champion", "champ", "champion_name", "champ_name", "champs", "character", "hero"])
+    col_vs = pick(["vs", "versus", "opponent", "against", "enemy", "target"])
+    col_wr = pick(["winrate", "win_rate", "wr", "winrate_pct", "winrate_percent", "win%"])
+    col_games = pick(["games", "game", "matches", "match", "n_games", "total_games", "total_matches", "sample", "samplesize"])
+
+    mapping = {}
+    if col_champion and col_champion != "champion":
+        mapping[col_champion] = "champion"
+    if col_vs and col_vs != "vs":
+        mapping[col_vs] = "vs"
+    if col_wr and col_wr != "winrate":
+        mapping[col_wr] = "winrate"
+    if col_games and col_games != "games":
+        mapping[col_games] = "games"
+
+    df = df.rename(columns=mapping)
+
+    missing = [c for c in ["champion", "vs", "winrate", "games"] if c not in df.columns]
+    if missing:
+        raise KeyError(f"Colunas faltando na aba Winrate_vs: {missing}. Colunas encontradas: {list(df.columns)}")
+    return df
+
+def _rename_columns_with(df: pd.DataFrame) -> pd.DataFrame:
+    """Garante colunas: champion, with, winrate, games"""
+    df = df.copy()
+    df.columns = [_norm_colname(c) for c in df.columns]
+
+    def pick(candidates):
+        for cand in candidates:
+            if cand in df.columns:
+                return cand
+        return None
+
+    col_champion = pick(["champion", "champ", "champion_name", "champ_name", "champs", "character", "hero"])
+    col_with = pick(["with", "ally", "pair", "together", "synergy_with", "with_champion"])
+    col_wr = pick(["winrate", "win_rate", "wr", "winrate_pct", "winrate_percent", "win%"])
+    col_games = pick(["games", "game", "matches", "match", "n_games", "total_games", "total_matches", "sample", "samplesize"])
+
+    mapping = {}
+    if col_champion and col_champion != "champion":
+        mapping[col_champion] = "champion"
+    if col_with and col_with != "with":
+        mapping[col_with] = "with"
+    if col_wr and col_wr != "winrate":
+        mapping[col_wr] = "winrate"
+    if col_games and col_games != "games":
+        mapping[col_games] = "games"
+
+    df = df.rename(columns=mapping)
+
+    missing = [c for c in ["champion", "with", "winrate", "games"] if c not in df.columns]
+    if missing:
+        raise KeyError(f"Colunas faltando na aba Winrate_with: {missing}. Colunas encontradas: {list(df.columns)}")
+    return df
+
+
 def init_from_excel(excel: Union[str, os.PathLike, "pd.ExcelFile", object]) -> None:
     """
     Carrega as abas Winrate_vs e Winrate_with a partir de:
@@ -46,8 +124,8 @@ def init_from_excel(excel: Union[str, os.PathLike, "pd.ExcelFile", object]) -> N
     - file-like (ex.: UploadedFile do Streamlit)
     """
     global _winrate_vs, _winrate_with
-    _winrate_vs = pd.read_excel(excel, sheet_name="Winrate_vs")
-    _winrate_with = pd.read_excel(excel, sheet_name="Winrate_with")
+    _winrate_vs = _rename_columns_vs(pd.read_excel(excel, sheet_name="Winrate_vs"))
+    _winrate_with = _rename_columns_with(pd.read_excel(excel, sheet_name="Winrate_with"))
 
 
 def _ensure_loaded() -> None:
