@@ -1,331 +1,207 @@
 # -*- coding: utf-8 -*-
 """
-MEGA winrate model (com shrinkage)
+MEGA LoL – Decisor (draft + odds) – versão Streamlit Cloud
 
-Diferenças vs versão antiga:
-- Aplica shrinkage Bayesiano simples por par (wins/games) para reduzir ruído de amostra pequena
-- Usa pesos ~sqrt(games) (com teto) para evitar que poucos pares gigantes dominem tudo
-- Carregamento flexível da base:
-  - por padrão, tenta abrir "dados_mega_merged.xlsx" na mesma pasta deste arquivo
-  - no Streamlit, você pode chamar init_from_excel(file_like) usando um uploader
+Mudanças:
+- Usa o modelo com shrinkage (modelo_winrate_mega_shrink_v2.py)
+- Remove Kelly: você decide stake (unidades fixas)
+- Regras de entrada:
+    A) odd >= 2.00 AND gap_pp >= 2.0
+    B) odd >= 1.70 AND gap_pp >= 3.0
 """
 
 from __future__ import annotations
 
-import math
-import os
-from typing import Optional, Union
+from typing import List, Optional, Tuple
 
-import pandas as pd
+import streamlit as st
 
-# ================================
-# Estado (dataframes carregados)
-# ================================
-
-_winrate_vs: Optional[pd.DataFrame] = None
-_winrate_with: Optional[pd.DataFrame] = None
-
-# ================================
-# Parâmetros de estabilidade (shrinkage)
-# ================================
-
-MU_GLOBAL = 0.50   # baseline (50%)
-K_PRIOR = 30.0     # força do prior (em "jogos virtuais") — ajuste se quiser
-
-# Peso por par (para média agregada)
-WEIGHT_CAP = 50.0  # teto do peso (evita dominância absoluta)
-
-# Nome padrão do arquivo
-DEFAULT_XLSX = "dados_mega_merged.xlsx"
+import modelo_winrate_mega_shrink_v2 as mega
 
 
+# ==========================
+# CONFIG
+# ==========================
 
-# ================================
-# Normalização de colunas (robusto)
-# ================================
+RULE_A_ODD_MIN = 2.00
+RULE_A_PP_MIN = 2.0
 
-def _norm_colname(c: str) -> str:
-    c = str(c).strip().lower()
-    c = c.replace(" ", "_")
-    c = c.replace("-", "_")
-    return c
+RULE_B_ODD_MIN = 1.70
+RULE_B_PP_MIN = 3.0
 
-def _rename_columns_vs(df: pd.DataFrame) -> pd.DataFrame:
-    """Garante colunas: champion, vs, winrate, games"""
-    df = df.copy()
-    df.columns = [_norm_colname(c) for c in df.columns]
 
-    def pick(candidates):
-        for cand in candidates:
-            if cand in df.columns:
-                return cand
+# ==========================
+# FUNÇÕES AUX
+# ==========================
+
+def parse_float(s: str) -> Optional[float]:
+    if s is None:
         return None
-
-    col_champion = pick(["champion", "champ", "champion_name", "champ_name", "champs", "character", "hero"])
-    col_vs = pick(["vs", "versus", "opponent", "against", "enemy", "target"])
-    col_wr = pick(["winrate", "win_rate", "wr", "winrate_pct", "winrate_percent", "win%"])
-    col_games = pick(["games", "game", "matches", "match", "n_games", "total_games", "total_matches", "sample", "samplesize"])
-
-    mapping = {}
-    if col_champion and col_champion != "champion":
-        mapping[col_champion] = "champion"
-    if col_vs and col_vs != "vs":
-        mapping[col_vs] = "vs"
-    if col_wr and col_wr != "winrate":
-        mapping[col_wr] = "winrate"
-    if col_games and col_games != "games":
-        mapping[col_games] = "games"
-
-    df = df.rename(columns=mapping)
-
-    missing = [c for c in ["champion", "vs", "winrate", "games"] if c not in df.columns]
-    if missing:
-        raise KeyError(f"Colunas faltando na aba Winrate_vs: {missing}. Colunas encontradas: {list(df.columns)}")
-    return df
-
-def _rename_columns_with(df: pd.DataFrame) -> pd.DataFrame:
-    """Garante colunas: champion, with, winrate, games"""
-    df = df.copy()
-    df.columns = [_norm_colname(c) for c in df.columns]
-
-    def pick(candidates):
-        for cand in candidates:
-            if cand in df.columns:
-                return cand
-        return None
-
-    col_champion = pick(["champion", "champ", "champion_name", "champ_name", "champs", "character", "hero"])
-    col_with = pick(["with", "ally", "pair", "together", "synergy_with", "with_champion"])
-    col_wr = pick(["winrate", "win_rate", "wr", "winrate_pct", "winrate_percent", "win%"])
-    col_games = pick(["games", "game", "matches", "match", "n_games", "total_games", "total_matches", "sample", "samplesize"])
-
-    mapping = {}
-    if col_champion and col_champion != "champion":
-        mapping[col_champion] = "champion"
-    if col_with and col_with != "with":
-        mapping[col_with] = "with"
-    if col_wr and col_wr != "winrate":
-        mapping[col_wr] = "winrate"
-    if col_games and col_games != "games":
-        mapping[col_games] = "games"
-
-    df = df.rename(columns=mapping)
-
-    missing = [c for c in ["champion", "with", "winrate", "games"] if c not in df.columns]
-    if missing:
-        raise KeyError(f"Colunas faltando na aba Winrate_with: {missing}. Colunas encontradas: {list(df.columns)}")
-    return df
-
-
-def init_from_excel(excel: Union[str, os.PathLike, "pd.ExcelFile", object]) -> None:
-    """
-    Carrega as abas Winrate_vs e Winrate_with a partir de:
-    - caminho (str/path)
-    - file-like (ex.: UploadedFile do Streamlit)
-    """
-    global _winrate_vs, _winrate_with
-    _winrate_vs = _rename_columns_vs(pd.read_excel(excel, sheet_name="Winrate_vs"))
-    _winrate_with = _rename_columns_with(pd.read_excel(excel, sheet_name="Winrate_with"))
-
-
-def _ensure_loaded() -> None:
-    """Carrega a base padrão se ainda não tiver sido carregada."""
-    global _winrate_vs, _winrate_with
-    if _winrate_vs is not None and _winrate_with is not None:
-        return
-
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(base_dir, DEFAULT_XLSX)
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Não achei '{DEFAULT_XLSX}' em: {path}\n"
-            f"- Coloque o arquivo nessa mesma pasta, ou\n"
-            f"- No Streamlit, use o uploader e chame init_from_excel()."
-        )
-    init_from_excel(path)
-
-
-# ================================
-# Helpers
-# ================================
-
-def limpar_numero(x) -> float:
-    """
-    Converte números da planilha para float.
-    Aceita:
-    - 0.44
-    - '0.44'
-    - '8,886.00'
-    - '55%'
-    - 55  (interpreta como 55%)
-    """
-    if pd.isna(x):
-        return 0.0
-    if isinstance(x, (int, float)):
-        v = float(x)
-        # se veio como 55 em vez de 0.55, converte pra fração
-        return v / 100.0 if v > 1.0 else v
-
-    s = str(x).strip()
+    s = str(s).strip().replace(",", ".")
     if not s:
-        return 0.0
-
-    # remove separadores comuns
-    s = s.replace(" ", "")
-    s = s.replace("%", "")
-    # cuidado: alguns exports usam vírgula como milhar
-    # estratégia: remove vírgulas e depois tenta float; se falhar, troca vírgula por ponto
-    try:
-        v = float(s.replace(",", ""))
-        return v / 100.0 if v > 1.0 else v
-    except Exception:
-        try:
-            v = float(s.replace(".", "").replace(",", "."))
-            return v / 100.0 if v > 1.0 else v
-        except Exception:
-            return 0.0
-
-
-def normalizar_nome(nome) -> Optional[str]:
-    """Normaliza nome de campeão (string) para bater com a planilha."""
-    if pd.isna(nome):
         return None
-    s = str(nome).strip()
-    return s if s else None
+    try:
+        return float(s)
+    except Exception:
+        return None
 
 
-def shrink_prob(wins: float, games: float, mu: float = MU_GLOBAL, k: float = K_PRIOR) -> float:
-    """p_hat = (wins + k*mu) / (games + k)"""
-    games = max(float(games), 0.0)
-    wins = max(float(wins), 0.0)
-    return (wins + k * mu) / (games + k)
+def parse_champs(raw: str) -> List[str]:
+    return [c.strip() for c in raw.split(",") if c.strip()]
 
 
-def weight_from_games(games: float) -> float:
-    """Peso saturado ~sqrt(games), com teto."""
-    g = max(float(games), 0.0)
-    w = math.sqrt(g)
-    return min(w, WEIGHT_CAP)
+def implied_prob_pct(odd: float) -> Optional[float]:
+    if odd is None or odd <= 1.0:
+        return None
+    return 100.0 / odd
 
 
-# ================================
-# Métricas VS e WITH (com shrink)
-# ================================
+def pick_side(p_azul: float, p_vermelho: float) -> str:
+    return "AZUL" if p_azul >= p_vermelho else "VERMELHO"
 
-def calcular_winrate_vs(time_a, time_b) -> float:
+
+def get_odd_for_side(side: str, odd_azul: float, odd_vermelho: float) -> float:
+    return odd_azul if side == "AZUL" else odd_vermelho
+
+
+def should_bet(odd: float, gap_pp: float) -> Tuple[bool, str]:
     """
-    Winrate do time_a contra time_b, agregado sobre pares (A vs B).
-    Retorna em % (0–100).
+    Retorna (entra?, motivo)
     """
-    _ensure_loaded()
-    assert _winrate_vs is not None
+    if odd is None or odd <= 1.0:
+        return False, "Odd inválida"
 
-    # normaliza
-    A = [normalizar_nome(c) for c in time_a]
-    B = [normalizar_nome(c) for c in time_b]
+    if odd >= RULE_A_ODD_MIN and gap_pp >= RULE_A_PP_MIN:
+        return True, f"Regra A: odd ≥ {RULE_A_ODD_MIN:.2f} e pp ≥ {RULE_A_PP_MIN:.1f}"
+    if odd >= RULE_B_ODD_MIN and gap_pp >= RULE_B_PP_MIN:
+        return True, f"Regra B: odd ≥ {RULE_B_ODD_MIN:.2f} e pp ≥ {RULE_B_PP_MIN:.1f}"
 
-    total_w = 0.0
-    total_weight = 0.0
-
-    for a in A:
-        if not a:
-            continue
-        for b in B:
-            if not b:
-                continue
-
-            row = _winrate_vs[(_winrate_vs["champion"] == a) & (_winrate_vs["vs"] == b)]
-            if row.empty:
-                continue
-
-            # alguns arquivos têm colunas como strings
-            wr = limpar_numero(row.iloc[0]["winrate"])   # fração
-            games = limpar_numero(row.iloc[0]["games"])  # pode vir gigante
-
-            wins = wr * games
-            p_hat = shrink_prob(wins=wins, games=games)
-
-            w = weight_from_games(games)
-            total_w += p_hat * w
-            total_weight += w
-
-    if total_weight <= 0:
-        return MU_GLOBAL * 100.0
-
-    return (total_w / total_weight) * 100.0
+    # razões de não entrada (mais úteis do que um 'não')
+    if odd < RULE_B_ODD_MIN:
+        return False, f"Odd < {RULE_B_ODD_MIN:.2f}"
+    if odd < RULE_A_ODD_MIN and gap_pp < RULE_B_PP_MIN:
+        return False, f"pp < {RULE_B_PP_MIN:.1f} para odd < {RULE_A_ODD_MIN:.2f}"
+    if odd >= RULE_A_ODD_MIN and gap_pp < RULE_A_PP_MIN:
+        return False, f"pp < {RULE_A_PP_MIN:.1f} (mesmo com odd ≥ {RULE_A_ODD_MIN:.2f})"
+    return False, "Não bate as regras"
 
 
-def calcular_winrate_with(time) -> float:
-    """
-    Sinergia WITH do time, agregado sobre pares (A with B).
-    Retorna em % (0–100).
-    """
-    _ensure_loaded()
-    assert _winrate_with is not None
+# ==========================
+# UI
+# ==========================
 
-    champs = [normalizar_nome(c) for c in time]
+st.set_page_config(page_title="MEGA LoL – Decisor", layout="centered")
+st.title("MEGA LoL – Decisor (draft + odds)")
+st.caption(
+    f"Entrada: (A) odd ≥ {RULE_A_ODD_MIN:.2f} e pp ≥ {RULE_A_PP_MIN:.1f} "
+    f"OU (B) odd ≥ {RULE_B_ODD_MIN:.2f} e pp ≥ {RULE_B_PP_MIN:.1f}. "
+    "pp = |p_model_azul − p_model_vermelho| (pontos percentuais)."
+)
 
-    total_w = 0.0
-    total_weight = 0.0
+with st.sidebar:
+    st.header("Base do modelo")
+    st.write(
+        "Opção 1) Deixe `dados_mega_merged.xlsx` na mesma pasta do app (recomendado).\n"
+        "Opção 2) Faça upload aqui (Streamlit Cloud)."
+    )
+    uploaded = st.file_uploader("Upload dados_mega_merged.xlsx", type=["xlsx"])
+    if uploaded is not None:
+        try:
+            mega.init_from_excel(uploaded)
+            st.success("Base carregada via upload.")
+        except Exception as e:
+            st.error(f"Falha ao carregar base: {e}")
 
-    # pares não ordenados (i < j)
-    for i in range(len(champs)):
-        a = champs[i]
-        if not a:
-            continue
-        for j in range(i + 1, len(champs)):
-            b = champs[j]
-            if not b:
-                continue
-
-            # tenta A with B; se não achar, tenta B with A
-            row = _winrate_with[(_winrate_with["champion"] == a) & (_winrate_with["with"] == b)]
-            if row.empty:
-                row = _winrate_with[(_winrate_with["champion"] == b) & (_winrate_with["with"] == a)]
-            if row.empty:
-                continue
-
-            wr = limpar_numero(row.iloc[0]["winrate"])
-            games = limpar_numero(row.iloc[0]["games"])
-
-            wins = wr * games
-            p_hat = shrink_prob(wins=wins, games=games)
-
-            w = weight_from_games(games)
-            total_w += p_hat * w
-            total_weight += w
-
-    if total_weight <= 0:
-        return MU_GLOBAL * 100.0
-
-    return (total_w / total_weight) * 100.0
+    st.divider()
+    st.header("Stake")
+    unit_brl = st.number_input("1 unidade (R$)", min_value=1.0, value=100.0, step=10.0)
+    units = st.number_input("Quantas unidades apostar", min_value=0.0, value=1.0, step=0.5)
 
 
-def calcular_chance_vitoria(time_azul, time_vermelho, verbose: bool = False):
-    """
-    Retorna (chance_azul, chance_vermelho) em %.
+col1, col2 = st.columns(2)
+with col1:
+    champs_azul_raw = st.text_input(
+        "Time AZUL (5 champs, separados por vírgula)",
+        value="Shen, Vi, Syndra, Smolder, Nautilus",
+    )
+    odd_azul_str = st.text_input("Odd time AZUL", value="2,30")
 
-    Nota: isso é um score normalizado (não prob calibrada).
-    """
-    azul_vs = calcular_winrate_vs(time_azul, time_vermelho)
-    vermelho_vs = calcular_winrate_vs(time_vermelho, time_azul)
+with col2:
+    champs_vermelho_raw = st.text_input(
+        "Time VERMELHO (5 champs, separados por vírgula)",
+        value="Vayne, Aatrox, Ahri, Sivir, Lulu",
+    )
+    odd_vermelho_str = st.text_input("Odd time VERMELHO", value="1,55")
 
-    azul_with = calcular_winrate_with(time_azul)
-    vermelho_with = calcular_winrate_with(time_vermelho)
+botao = st.button("Calcular", type="primary")
 
-    score_azul = (azul_vs + azul_with) / 2.0
-    score_vermelho = (vermelho_vs + vermelho_with) / 2.0
+if botao:
+    odd_azul = parse_float(odd_azul_str)
+    odd_vermelho = parse_float(odd_vermelho_str)
 
-    soma = score_azul + score_vermelho
-    if soma <= 0:
-        return 50.0, 50.0
+    champs_azul = parse_champs(champs_azul_raw)
+    champs_vermelho = parse_champs(champs_vermelho_raw)
 
-    chance_azul = (score_azul / soma) * 100.0
-    chance_vermelho = (score_vermelho / soma) * 100.0
+    if odd_azul is None or odd_vermelho is None:
+        st.error("Odd inválida. Use algo como 2,30 ou 1.8.")
+        st.stop()
+    if len(champs_azul) != 5 or len(champs_vermelho) != 5:
+        st.error("Cada time precisa ter exatamente 5 campeões.")
+        st.stop()
 
-    if verbose:
-        print(f"[DEBUG] azul_vs={azul_vs:.2f} azul_with={azul_with:.2f} score_azul={score_azul:.2f}")
-        print(f"[DEBUG] ver_vs={vermelho_vs:.2f} ver_with={vermelho_with:.2f} score_ver={score_vermelho:.2f}")
-        print(f"[DEBUG] chance azul={chance_azul:.2f} vermelho={chance_vermelho:.2f}")
+    # modelo
+    try:
+        p_azul, p_vermelho = mega.calcular_chance_vitoria(
+            champs_azul, champs_vermelho, verbose=False
+        )
+    except Exception as e:
+        st.error(f"Erro no modelo/base: {e}")
+        st.stop()
 
-    return chance_azul, chance_vermelho
+    gap_pp = abs(p_azul - p_vermelho)  # pontos percentuais
+
+    st.subheader("Score do modelo (p_model)")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("p_model AZUL", f"{p_azul:.2f}%")
+    with c2:
+        st.metric("p_model VERMELHO", f"{p_vermelho:.2f}%")
+    with c3:
+        st.metric("pp (gap)", f"{gap_pp:.2f} pp")
+
+    lado = pick_side(p_azul, p_vermelho)
+    odd_escolhida = get_odd_for_side(lado, odd_azul, odd_vermelho)
+
+    p_house = implied_prob_pct(odd_escolhida)
+    p_model_side = p_azul if lado == "AZUL" else p_vermelho
+    edge_pp = (p_model_side - p_house) if p_house is not None else None
+
+    entra, motivo = should_bet(odd_escolhida, gap_pp)
+
+    st.subheader("Decisão")
+    d1, d2, d3, d4 = st.columns(4)
+    with d1:
+        st.metric("Lado", lado)
+    with d2:
+        st.metric("Odd usada", f"{odd_escolhida:.2f}")
+    with d3:
+        st.metric("p_house (impl.)", f"{p_house:.2f}%" if p_house is not None else "-")
+    with d4:
+        st.metric("Edge vs odd (pp)", f"{edge_pp:.2f}" if edge_pp is not None else "-")
+
+    stake_brl = units * unit_brl
+
+    if entra and units > 0:
+        win_profit_u = (odd_escolhida - 1.0) * units
+        lose_profit_u = -1.0 * units
+
+        st.success(f"✅ ENTRA — {motivo}")
+        st.write(f"Stake: **{units:.2f}u** (R$ {stake_brl:,.2f})".replace(",", "X").replace(".", ",").replace("X", "."))
+        st.write(f"Se ganhar: **+{win_profit_u:.2f}u** (R$ {(win_profit_u*unit_brl):,.2f})".replace(",", "X").replace(".", ",").replace("X", "."))
+        st.write(f"Se perder: **{lose_profit_u:.2f}u** (R$ {(lose_profit_u*unit_brl):,.2f})".replace(",", "X").replace(".", ",").replace("X", "."))
+    else:
+        st.warning(f"❌ Sem entrada — {motivo}")
+        st.write(f"Stake: **0u**")
+
+    st.divider()
+    st.caption("Nota: p_model é score normalizado; pp mede força do sinal (diferença entre lados).")
