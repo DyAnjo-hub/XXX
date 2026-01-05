@@ -50,8 +50,15 @@ def _norm_colname(c: str) -> str:
     c = c.replace("-", "_")
     return c
 
+
 def _rename_columns_vs(df: pd.DataFrame) -> pd.DataFrame:
-    """Garante colunas: champion, vs, winrate, games"""
+    """
+    Normaliza a aba Winrate_vs para conter colunas: champion, vs, winrate, games.
+
+    Suporta dois esquemas comuns:
+      A) champion + vs + games + winrate
+      B) campeao + champion + games + winrate  (onde 'campeao' é o campeão base e 'champion' é o oponente)
+    """
     df = df.copy()
     df.columns = [_norm_colname(c) for c in df.columns]
 
@@ -61,30 +68,49 @@ def _rename_columns_vs(df: pd.DataFrame) -> pd.DataFrame:
                 return cand
         return None
 
-    col_champion = pick(["champion", "champ", "champion_name", "champ_name", "champs", "character", "hero"])
-    col_vs = pick(["vs", "versus", "opponent", "against", "enemy", "target"])
-    col_wr = pick(["winrate", "win_rate", "wr", "winrate_pct", "winrate_percent", "win%"])
-    col_games = pick(["games", "game", "matches", "match", "n_games", "total_games", "total_matches", "sample", "samplesize"])
+    # Coluna do campeão "base" (o que está sendo avaliado)
+    col_base = pick(["campeao", "champion_a", "champion1", "champion_1", "champion", "champ", "champion_name", "champ_name", "character", "hero"])
+    # Coluna do oponente
+    col_vs = pick(["vs", "against", "opponent", "enemy", "versus", "matchup", "champion_b", "champion2", "champion_2", "opponent_champion"])
+
+    # Se não existe uma coluna explícita de vs, mas temos (campeao + champion), assume-se esse esquema.
+    if col_vs is None and "campeao" in df.columns and "champion" in df.columns:
+        col_base = "campeao"
+        col_vs = "champion"
+
+    col_games = pick(["games", "matches", "n", "count", "samples", "sample_size"])
+    col_wr = pick(["winrate", "wr", "win_rate", "win rate", "wins_rate"])
 
     mapping = {}
-    if col_champion and col_champion != "champion":
-        mapping[col_champion] = "champion"
+    if col_base and col_base != "champion":
+        mapping[col_base] = "champion"
     if col_vs and col_vs != "vs":
         mapping[col_vs] = "vs"
-    if col_wr and col_wr != "winrate":
-        mapping[col_wr] = "winrate"
     if col_games and col_games != "games":
         mapping[col_games] = "games"
+    if col_wr and col_wr != "winrate":
+        mapping[col_wr] = "winrate"
 
     df = df.rename(columns=mapping)
 
     missing = [c for c in ["champion", "vs", "winrate", "games"] if c not in df.columns]
     if missing:
-        raise KeyError(f"Colunas faltando na aba Winrate_vs: {missing}. Colunas encontradas: {list(df.columns)}")
+        raise KeyError(
+            f"Colunas faltando na aba Winrate_vs: {missing}. "
+            f"Colunas encontradas: {list(df.columns)}. "
+            "Dica: a aba precisa ter (campeao+champion) ou (champion+vs), além de games e winrate."
+        )
     return df
 
+
 def _rename_columns_with(df: pd.DataFrame) -> pd.DataFrame:
-    """Garante colunas: champion, with, winrate, games"""
+    """
+    Normaliza a aba Winrate_with para conter colunas: champion, with, winrate, games.
+
+    Suporta dois esquemas comuns:
+      A) champion + with + games + winrate
+      B) campeao + champion + games + winrate (onde 'campeao' é o campeão base e 'champion' é o aliado)
+    """
     df = df.copy()
     df.columns = [_norm_colname(c) for c in df.columns]
 
@@ -94,26 +120,35 @@ def _rename_columns_with(df: pd.DataFrame) -> pd.DataFrame:
                 return cand
         return None
 
-    col_champion = pick(["champion", "champ", "champion_name", "champ_name", "champs", "character", "hero"])
-    col_with = pick(["with", "ally", "pair", "together", "synergy_with", "with_champion"])
-    col_wr = pick(["winrate", "win_rate", "wr", "winrate_pct", "winrate_percent", "win%"])
-    col_games = pick(["games", "game", "matches", "match", "n_games", "total_games", "total_matches", "sample", "samplesize"])
+    col_base = pick(["campeao", "champion_a", "champion1", "champion_1", "champion", "champ", "champion_name", "champ_name", "character", "hero"])
+    col_with = pick(["with", "ally", "pair", "together", "synergy_with", "with_champion", "champion_b", "champion2", "champion_2"])
+
+    if col_with is None and "campeao" in df.columns and "champion" in df.columns:
+        col_base = "campeao"
+        col_with = "champion"
+
+    col_games = pick(["games", "matches", "n", "count", "samples", "sample_size"])
+    col_wr = pick(["winrate", "wr", "win_rate", "win rate", "wins_rate"])
 
     mapping = {}
-    if col_champion and col_champion != "champion":
-        mapping[col_champion] = "champion"
+    if col_base and col_base != "champion":
+        mapping[col_base] = "champion"
     if col_with and col_with != "with":
         mapping[col_with] = "with"
-    if col_wr and col_wr != "winrate":
-        mapping[col_wr] = "winrate"
     if col_games and col_games != "games":
         mapping[col_games] = "games"
+    if col_wr and col_wr != "winrate":
+        mapping[col_wr] = "winrate"
 
     df = df.rename(columns=mapping)
 
     missing = [c for c in ["champion", "with", "winrate", "games"] if c not in df.columns]
     if missing:
-        raise KeyError(f"Colunas faltando na aba Winrate_with: {missing}. Colunas encontradas: {list(df.columns)}")
+        raise KeyError(
+            f"Colunas faltando na aba Winrate_with: {missing}. "
+            f"Colunas encontradas: {list(df.columns)}. "
+            "Dica: a aba precisa ter (campeao+champion) ou (champion+with), além de games e winrate."
+        )
     return df
 
 
