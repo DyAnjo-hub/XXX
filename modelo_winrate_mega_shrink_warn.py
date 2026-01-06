@@ -311,100 +311,99 @@ def diagnostico_draft(time_azul, time_vermelho):
 # Aviso de amostra baixa (útil no app)
 # ================================
 
+
 def sample_warning(time_azul, time_vermelho, *, min_ratio: float = 0.70, min_median_games: float = 15.0):
     """
-    Retorna um aviso simples para o app:
-      - champs: lista de campeões com baixa cobertura (VS/WITH)
-      - metrics: resumo curto (medianas de games e cobertura geral)
+    Aviso simples de amostra/cobertura baixa por campeão.
+    Retorna:
+      - champs: lista (strings) dos campeões "suspeitos"
     """
     _ensure_loaded()
-    assert _winrate_vs is not None and _winrate_with is not None
+    if _vs_stats is None or _with_stats is None:
+        return {"champs": []}
 
     def norm(x):
-        return normalizar_nome(x)
+        return norm_name(x)
 
     A_raw = list(time_azul)
     B_raw = list(time_vermelho)
     A = [norm(c) for c in A_raw]
     B = [norm(c) for c in B_raw]
 
-    def _sum_games(series) -> float:
-        try:
-            return float(series.apply(limpar_numero).sum())
-        except Exception:
+    def _median(nums):
+        nums = [float(x) for x in nums if x is not None]
+        if not nums:
             return 0.0
+        nums.sort()
+        mid = len(nums) // 2
+        return nums[mid] if len(nums) % 2 == 1 else (nums[mid - 1] + nums[mid]) / 2.0
 
-    def vs_games(a, b):
-        row = _winrate_vs[(_winrate_vs["champion"] == a) & (_winrate_vs["vs"] == b)]
-        if row.empty:
-            return None
-        g = _sum_games(row["games"])
-        return g if g > 0 else None
-
-    def with_games(a, b):
-        row = _winrate_with[(_winrate_with["champion"] == a) & (_winrate_with["with"] == b)]
-        if row.empty:
-            row = _winrate_with[(_winrate_with["champion"] == b) & (_winrate_with["with"] == a)]
-        if row.empty:
-            return None
-        g = _sum_games(row["games"])
-        return g if g > 0 else None
-
-    def median(vals):
-        if not vals:
-            return 0.0
-        xs = sorted(float(v) for v in vals)
-        return xs[len(xs)//2]
-
-    suspects = set()
-
-    def check_champ(champ, opponents, allies):
-        # VS por champ
-        vs_g = []
-        vs_f = 0
-        vs_t = 0
-        for o in opponents:
+    # --- VS pairs: cada champ vs 5 oponentes ---
+    def vs_stats_for(champ: str, opps: list[str]) -> tuple[int, int, float]:
+        found = 0
+        games_list = []
+        total = 0
+        for o in opps:
             if not champ or not o:
                 continue
-            vs_t += 1
-            g = vs_games(champ, o)
-            if g is not None:
-                vs_f += 1
-                vs_g.append(g)
-        vs_ratio = (vs_f / vs_t) if vs_t else 0.0
-        vs_med = median(vs_g)
+            total += 1
+            key = (champ, o)
+            if key in _vs_stats:
+                wins, games = _vs_stats[key]
+                found += 1
+                games_list.append(games)
+        return found, max(total, 1), _median(games_list)
 
-        # WITH por champ
-        w_g = []
-        w_f = 0
-        w_t = 0
+    # --- WITH pairs: cada champ com 4 aliados ---
+    def with_stats_for(champ: str, allies: list[str]) -> tuple[int, int, float]:
+        found = 0
+        games_list = []
+        total = 0
         for a in allies:
-            if not champ or not a:
+            if not champ or not a or champ == a:
                 continue
-            w_t += 1
-            g = with_games(champ, a)
-            if g is not None:
-                w_f += 1
-                w_g.append(g)
-        w_ratio = (w_f / w_t) if w_t else 0.0
-        w_med = median(w_g)
+            total += 1
+            key1 = (champ, a)
+            key2 = (a, champ)
+            if key1 in _with_stats:
+                wins, games = _with_stats[key1]
+                found += 1
+                games_list.append(games)
+            elif key2 in _with_stats:
+                wins, games = _with_stats[key2]
+                found += 1
+                games_list.append(games)
+        return found, max(total, 1), _median(games_list)
 
-        if (vs_ratio < min_ratio) or (w_ratio < min_ratio) or (vs_med < min_median_games) or (w_med < min_median_games):
-            suspects.add(champ)
+    suspects: list[str] = []
 
-    for i, champ in enumerate(A):
-        allies = [c for j, c in enumerate(A) if j != i]
-        check_champ(champ, opponents=B, allies=allies)
+    # Avalia cada campeão dos dois lados
+    for side_raw, side_norm, opp_norm, team_norm in [
+        (A_raw, A, B, A),
+        (B_raw, B, A, B),
+    ]:
+        for raw_name, champ in zip(side_raw, side_norm):
+            if not champ:
+                continue
 
-    for i, champ in enumerate(B):
-        allies = [c for j, c in enumerate(B) if j != i]
-        check_champ(champ, opponents=A, allies=allies)
+            vs_found, vs_total, vs_med = vs_stats_for(champ, opp_norm)
+            allies = [c for c in team_norm if c and c != champ]
+            w_found, w_total, w_med = with_stats_for(champ, allies)
 
-    def pretty(ch):
-        for raw in A_raw + B_raw:
-            if normalizar_nome(raw) == ch:
-                return str(raw).strip()
-        return ch
+            low_vs = (vs_found / vs_total) < float(min_ratio) or vs_med < float(min_median_games)
+            low_w = (w_found / w_total) < float(min_ratio) or w_med < float(min_median_games)
 
-    champs_sorted = sorted({pretty(c) for c in suspects if c})
-    return {"champs": champs_sorted}
+            if low_vs or low_w:
+                # Usa o nome como o usuário digitou (raw_name)
+                suspects.append(str(raw_name).strip())
+
+    # remove duplicados preservando ordem
+    seen = set()
+    champs = []
+    for c in suspects:
+        k = c.lower()
+        if k not in seen:
+            seen.add(k)
+            champs.append(c)
+
+    return {"champs": champs}
